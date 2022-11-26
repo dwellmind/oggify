@@ -268,7 +268,6 @@ fn download_episode(runtime: &Runtime, session: &Session, id: SpotifyId) -> Resu
     let show = runtime
         .block_on(Show::get(&session, episode.show))
         .expect("Cannot get show metadata");
-    let artists_str = show.name;
     debug!(
         "File formats: {}",
         episode
@@ -278,9 +277,9 @@ fn download_episode(runtime: &Runtime, session: &Session, id: SpotifyId) -> Resu
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let ok_artists_name = remove_restricted_file_name_chars(&artists_str);
+    let ok_show_name = remove_restricted_file_name_chars(&show.name);
     let ok_track_name = remove_restricted_file_name_chars(&episode.name);
-    let file_name = format!("{} - {}.ogg", ok_artists_name, ok_track_name);
+    let file_name = format!("{} - {}.ogg", ok_show_name, ok_track_name);
     if std::path::Path::new(&file_name).exists() {
         warn!("File \"{}\" already exists, download skipped.", file_name);
     } else {
@@ -305,7 +304,7 @@ fn download_episode(runtime: &Runtime, session: &Session, id: SpotifyId) -> Resu
         std::fs::write(&file_name, &decrypted_buffer[0xa7..])
             .expect("Cannot write decrypted track");
         info!("Filename: {}", file_name);
-        tag_file(file_name, episode.name, show.name, artists_str, id.to_base62());
+        tag_file(file_name, episode.name, show.name, show.publisher, id.to_base62());
     }
     Ok(())
 }
