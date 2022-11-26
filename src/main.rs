@@ -19,7 +19,7 @@ use librespot_core::authentication::Credentials;
 use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_core::spotify_id::SpotifyId;
-use librespot_metadata::{Album, Artist, FileFormat, Metadata, Playlist, Track};
+use librespot_metadata::{Album, Artist, Episode, FileFormat, Metadata, Playlist, Show, Track};
 use regex::Regex;
 use tokio::runtime::Runtime;
 
@@ -35,10 +35,16 @@ fn main() {
     let runtime = get_runtime();
     let session = get_session(&runtime, args[1].to_owned(), args[2].to_owned());
 
-    let track_id_list = url_uri_to_track_id_list(&runtime, &session, input_reader);
+    let (track_id_list, episode_id_list) = url_uri_to_track_and_episode_id_list(&runtime, &session, input_reader);
 
     track_id_list.iter().for_each(|id| {
         match download_track(&runtime, &session, *id) {
+            Ok(value) => value,
+            Err(message) => warn!("{}", message),
+        };
+    });
+    episode_id_list.iter().for_each(|id| {
+        match download_episode(&runtime, &session, *id) {
             Ok(value) => value,
             Err(message) => warn!("{}", message),
         };
@@ -78,19 +84,24 @@ fn get_file_reader(file_name: &String) -> BufReader<std::fs::File> {
     }
 }
 
-fn url_uri_to_track_id_list(
+fn url_uri_to_track_and_episode_id_list(
     runtime: &Runtime,
     session: &Session,
     input_reader: BufReader<std::fs::File>,
-) -> Vec<SpotifyId> {
+) -> (Vec<SpotifyId>, Vec<SpotifyId>) {
     let spotify_track_uri = Regex::new(r"spotify:track:([[:alnum:]]+)").unwrap();
     let spotify_track_url = Regex::new(r"open\.spotify\.com/track/([[:alnum:]]+)").unwrap();
     let spotify_album_uri = Regex::new(r"spotify:album:([[:alnum:]]+)").unwrap();
     let spotify_album_url = Regex::new(r"open\.spotify\.com/album/([[:alnum:]]+)").unwrap();
     let spotify_playlist_uri = Regex::new(r"spotify:playlist:([[:alnum:]]+)").unwrap();
     let spotify_playlist_url = Regex::new(r"open\.spotify\.com/playlist/([[:alnum:]]+)").unwrap();
+    let spotify_episode_uri = Regex::new(r"spotify:episode:([[:alnum:]]+)").unwrap();
+    let spotify_episode_url = Regex::new(r"open\.spotify\.com/episode/([[:alnum:]]+)").unwrap();
+    let spotify_show_uri = Regex::new(r"spotify:show:([[:alnum:]]+)").unwrap();
+    let spotify_show_url = Regex::new(r"open\.spotify\.com/show/([[:alnum:]]+)").unwrap();
 
     let mut track_id_list: Vec<SpotifyId> = vec![];
+    let mut episode_id_list: Vec<SpotifyId> = vec![];
 
     for (_index, line) in input_reader.lines().enumerate() {
         let line = line.unwrap();
@@ -131,11 +142,31 @@ fn url_uri_to_track_id_list(
             for track_id in playlist.tracks.into_iter() {
                 track_id_list.push(track_id)
             }
+        } else if let Some(captures) = spotify_episode_url.captures(&line) {
+            episode_id_list.push(SpotifyId::from_base62(&captures[1]).ok().unwrap());
+        } else if let Some(captures) = spotify_episode_uri.captures(&line) {
+            episode_id_list.push(SpotifyId::from_base62(&captures[1]).ok().unwrap());
+        } else if let Some(captures) = spotify_show_url.captures(&line) {
+            let show_id: SpotifyId = SpotifyId::from_base62(&captures[1]).ok().unwrap();
+            let show = runtime
+                .block_on(Show::get(&session, show_id))
+                .expect("Cannot get show metadata.");
+            for track_id in show.episodes.into_iter() {
+                episode_id_list.push(track_id)
+            }
+        } else if let Some(captures) = spotify_show_uri.captures(&line) {
+            let show_id: SpotifyId = SpotifyId::from_base62(&captures[1]).ok().unwrap();
+            let show = runtime
+                .block_on(Show::get(&session, show_id))
+                .expect("Cannot get show metadata.");
+            for track_id in show.episodes.into_iter() {
+                episode_id_list.push(track_id)
+            }
         } else {
             warn!("Line \"{}\" is not a valid URL/URI.", line);
         }
     }
-    track_id_list
+    (track_id_list, episode_id_list)
 }
 
 fn download_track(runtime: &Runtime, session: &Session, id: SpotifyId) -> Result<(), String> {
@@ -222,6 +253,58 @@ fn download_track(runtime: &Runtime, session: &Session, id: SpotifyId) -> Result
             .block_on(Album::get(&session, track.album))
             .expect("Cannot get album metadata");
         tag_file(file_name, track.name, album.name, artists_strs.join(", "), id.to_base62());
+    }
+    Ok(())
+}
+
+fn download_episode(runtime: &Runtime, session: &Session, id: SpotifyId) -> Result<(), String> {
+    info!("Getting episode {}...", id.to_base62());
+    let episode = runtime
+        .block_on(Episode::get(&session, id))
+        .expect("Cannot get episode metadata");
+//    if !episode.available {
+//        warn!("Episode {} is not available.", id.to_base62());
+//    }
+    let show = runtime
+        .block_on(Show::get(&session, episode.show))
+        .expect("Cannot get show metadata");
+    debug!(
+        "File formats: {}",
+        episode
+            .files
+            .keys()
+            .map(|filetype| format!("{:?}", filetype))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let ok_show_name = remove_restricted_file_name_chars(&show.name);
+    let ok_track_name = remove_restricted_file_name_chars(&episode.name);
+    let file_name = format!("{} - {}.ogg", ok_show_name, ok_track_name);
+    if std::path::Path::new(&file_name).exists() {
+        warn!("File \"{}\" already exists, download skipped.", file_name);
+    } else {
+        let file_id = episode
+            .files
+            .get(&FileFormat::OGG_VORBIS_160)
+            .or(episode.files.get(&FileFormat::OGG_VORBIS_96))
+            .or(episode.files.get(&FileFormat::OGG_VORBIS_320))
+            .expect("Could not find a OGG_VORBIS format for the episode.");
+        let key = runtime
+            .block_on(session.audio_key().request(episode.id, *file_id))
+            .expect("Cannot get audio key");
+        let mut encrypted_file = runtime
+            .block_on(AudioFile::open(&session, *file_id, 320, true))
+            .unwrap();
+        let mut buffer = Vec::new();
+        let _read_all = encrypted_file.read_to_end(&mut buffer);
+        let mut decrypted_buffer = Vec::new();
+        AudioDecrypt::new(key, &buffer[..])
+            .read_to_end(&mut decrypted_buffer)
+            .expect("Cannot decrypt stream");
+        std::fs::write(&file_name, &decrypted_buffer[0xa7..])
+            .expect("Cannot write decrypted track");
+        info!("Filename: {}", file_name);
+        tag_file(file_name, episode.name, show.name, show.publisher, id.to_base62());
     }
     Ok(())
 }
